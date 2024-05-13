@@ -9,8 +9,12 @@ from typing import Optional
 import torch
 import torch.utils.data as data
 from PIL import Image
+import numpy as np
+from torchvision.transforms import ToTensor, ToPILImage
+import sys
 
 from .readers import create_reader
+from aug import denormalize_img
 
 _logger = logging.getLogger(__name__)
 
@@ -62,8 +66,7 @@ class ImageDataset(data.Dataset):
         if self.input_img_mode and not self.load_bytes:
             img = img.convert(self.input_img_mode)
         if self.transform is not None:
-            img = self.transform(img)
-
+            img = self.transform(image=np.array(img))["image"]   # img = self.transform(img)
         if target is None:
             target = -1
         elif self.target_transform is not None:

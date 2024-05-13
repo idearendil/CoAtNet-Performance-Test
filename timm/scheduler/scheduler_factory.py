@@ -82,7 +82,7 @@ def create_scheduler_v2(
         cycle_limit: int = 1,
         k_decay: float = 1.0,
         plateau_mode: str = 'max',
-        step_on_epochs: bool = True,
+        step_on_epochs: bool = False,
         updates_per_epoch: int = 0,
 ):
     t_initial = num_epochs
@@ -95,6 +95,8 @@ def create_scheduler_v2(
         t_initial = t_initial * updates_per_epoch
         warmup_t = warmup_t * updates_per_epoch
         decay_t = decay_t * updates_per_epoch
+        if decay_t == 0:
+            decay_t += 1
         decay_milestones = [d * updates_per_epoch for d in decay_milestones]
         cooldown_t = cooldown_t * updates_per_epoch
 

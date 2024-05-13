@@ -14,19 +14,32 @@ import json
 import logging
 import os
 import time
+import sys
 from collections import OrderedDict
 from contextlib import suppress
 from functools import partial
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.parallel
+import torch.nn.functional as F
 
+from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
 from timm.layers import apply_test_time_pool, set_fast_norm
 from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
+from sklearn.metrics import confusion_matrix
+from PIL import Image
+import matplotlib.pyplot as plt
+import seaborn as sns
+from aug import classify_albumentations, denormalize_img
+from torchvision import transforms
+from torchvision.transforms import ToTensor, ToPILImage
+import torchvision.transforms.functional as TF
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 try:
     from apex import amp
@@ -59,7 +72,7 @@ parser.add_argument('--data-dir', metavar='DIR',
                     help='path to dataset (root dir)')
 parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
-parser.add_argument('--split', metavar='NAME', default='validation',
+parser.add_argument('--split', metavar='NAME', default='val',
                     help='dataset split (default: validation)')
 parser.add_argument('--num-samples', default=None, type=int,
                     metavar='N', help='Manually specify num samples in dataset split, for IterableDatasets.')
@@ -80,13 +93,13 @@ parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=64, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=None, nargs=3, type=int,
+parser.add_argument('--input-size', default=[3, 224, 224], nargs=3, type=int,
                     metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
@@ -264,6 +277,10 @@ def validate(args):
         input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
     else:
         input_img_mode = args.input_img_mode
+
+    transform_val = classify_albumentations(augment=False)
+
+    # timm.data.dataset.ImageDataset
     dataset = create_dataset(
         root=root_dir,
         name=args.dataset,
@@ -275,7 +292,12 @@ def validate(args):
         input_key=args.input_key,
         input_img_mode=input_img_mode,
         target_key=args.target_key,
+        transform = transform_val
     )
+
+    from torch.utils.data import Dataset, DataLoader
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
 
     if args.valid_labels:
         with open(args.valid_labels, 'r') as f:
@@ -289,27 +311,45 @@ def validate(args):
         real_labels = None
 
     crop_pct = 1.0 if test_time_pool else data_config['crop_pct']
-    loader = create_loader(
-        dataset,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        use_prefetcher=args.prefetcher,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        crop_pct=crop_pct,
-        crop_mode=data_config['crop_mode'],
-        crop_border_pixels=args.crop_border_pixels,
-        pin_memory=args.pin_mem,
-        device=device,
-        tf_preprocessing=args.tf_preprocessing,
-    )
+
+    # timm.data.loader.Prefetchloader
+    # sampler : <torch.utils.data.sampler.SequentialSampler object at 0x76474c0bbe20>
+    # loader = create_loader(
+    #     dataset = dataset,
+    #     input_size=data_config['input_size'],
+    #     batch_size=args.batch_size,
+    #     custom = True,
+    #     augment = False,
+    #     use_prefetcher=args.prefetcher,
+    #     interpolation=data_config['interpolation'],
+    #     mean=data_config['mean'],
+    #     std=data_config['std'],
+    #     num_workers=args.workers,
+    #     crop_pct=crop_pct,
+    #     crop_mode=data_config['crop_mode'],
+    #     crop_border_pixels=args.crop_border_pixels,
+    #     pin_memory=args.pin_mem,
+    #     device=device,
+    #     tf_preprocessing=args.tf_preprocessing,
+    # )
 
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+
+    all_predictions = []
+    all_targets = []
+
+    THRESHOLD = 0.5
+
+    EXP_NAME = args.checkpoint.split('/')[-2]
+    DATA_NAME = args.data_dir.split('/')[-1]
+    OUTPUT_DIR = utils.get_outdir('./output/test', EXP_NAME, DATA_NAME)
+
+    miss_imgs_dir = f'{OUTPUT_DIR}/misclassified_imgs'
+    if not os.path.exists(miss_imgs_dir):
+        os.makedirs(miss_imgs_dir)
 
     model.eval()
     with torch.no_grad():
@@ -322,9 +362,14 @@ def validate(args):
 
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):
-            if args.no_prefetcher:
-                target = target.to(device)
-                input = input.to(device)
+            # for idx in range(len(input)):
+            #     img = (input[batch_idx*len(input) + idx])
+            #     img = denormalize_img(img)
+            #     img = TF.to_pil_image(img)
+            #     img.save(f"/home/CoAtNet/pytorch-image-models/aug_data_sample/dataloader_img_2/Loader_with_normal_denormal/{batch_idx*len(input) + idx}_train.jpg")
+            
+            target = target.to(device)
+            input = input.to(device)
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
@@ -344,6 +389,39 @@ def validate(args):
             losses.update(loss.item(), input.size(0))
             top1.update(acc1.item(), input.size(0))
             top5.update(acc5.item(), input.size(0))
+
+            # save misclassified imgs
+            # predictions = output.argmax(dim=1)
+
+            # 모델 출력 (output)을 softmax를 사용하여 확률로 변환
+            probabilities = F.softmax(output, dim=1)
+
+            # 클래스 0일 확률이 0.5 이상이면 0으로 예측, 그렇지 않으면 1로 예측
+            # 확률 0.5보다 작음 -> FALSE -> 0으로 예측
+            predictions = (probabilities[:, 0] < THRESHOLD).long()
+
+
+            misclassified_indices = (predictions != target).nonzero().squeeze()
+
+            if misclassified_indices.numel() > 0:
+                if misclassified_indices.dim() == 0:
+                    misclassified_indices = [misclassified_indices.item()]
+                else:
+                    misclassified_indices = misclassified_indices.tolist()
+
+                for idx in misclassified_indices:
+                    true_class = target[idx].item()
+                    predicted_class = predictions[idx].item()
+                    image_name = f"true-{true_class}_predicted-{predicted_class}_batch-{batch_idx}_index-{idx}.png"
+                    misclassified_image_path = os.path.join(miss_imgs_dir, image_name)
+
+                    img = (input[idx])
+                    img = denormalize_img(img)
+                    img = ToPILImage()(img)
+                    img.save(misclassified_image_path)
+                
+            all_predictions.extend(predictions.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -365,6 +443,32 @@ def validate(args):
                         top5=top5
                     )
                 )
+
+        conf_matrix = confusion_matrix(all_targets, all_predictions)
+        precision_class_0 = precision_score(all_targets, all_predictions, pos_label=0)
+        recall_class_0 = recall_score(all_targets, all_predictions, pos_label=0)
+        f1_class_0 = f1_score(all_targets, all_predictions, pos_label=0)
+
+        # Log the metrics
+        _logger.info(
+            f"Class 0 Precision: {precision_class_0:.3f} "
+            f"Class 0 Recall: {recall_class_0:.3f} "
+            f"Class 0 F1 Score: {f1_class_0:.3f}"
+        )
+
+
+        num_classes = args.num_classes
+        class_names = ["50", "others"]
+
+        # confusion matrix 시각화
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+        plt.xlabel('Predicted labels')
+        plt.ylabel('True labels')
+        plt.title('Confusion Matrix')
+        plt.tight_layout()  
+        plt.savefig(f'{OUTPUT_DIR}/confusion_matrix.png')  
+        plt.show()
 
     if real_labels is not None:
         # real labels mode replaces topk values at the end

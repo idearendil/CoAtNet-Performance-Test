@@ -23,6 +23,11 @@ from .random_erasing import RandomErasing
 from .mixup import FastCollateMixup
 from .transforms_factory import create_transform
 
+# custom augmentation
+import sys
+sys.path.append('/home/CoAtNet/pytorch-image-models')
+from aug import classify_albumentations
+
 _logger = logging.getLogger(__name__)
 
 
@@ -190,6 +195,8 @@ def create_loader(
         dataset: Union[ImageDataset, IterableImageDataset],
         input_size: Union[int, Tuple[int, int], Tuple[int, int, int]],
         batch_size: int,
+        custom: bool = True,    # for custom augmentation func
+        augment: bool = True,   # True for training set
         is_training: bool = False,
         no_aug: bool = False,
         re_prob: float = 0.,
@@ -277,34 +284,37 @@ def create_loader(
     if re_split:
         # apply RE to second half of batch if no aug split otherwise line up with aug split
         re_num_splits = num_aug_splits or 2
-    dataset.transform = create_transform(
-        input_size,
-        is_training=is_training,
-        no_aug=no_aug,
-        train_crop_mode=train_crop_mode,
-        scale=scale,
-        ratio=ratio,
-        hflip=hflip,
-        vflip=vflip,
-        color_jitter=color_jitter,
-        color_jitter_prob=color_jitter_prob,
-        grayscale_prob=grayscale_prob,
-        gaussian_blur_prob=gaussian_blur_prob,
-        auto_augment=auto_augment,
-        interpolation=interpolation,
-        mean=mean,
-        std=std,
-        crop_pct=crop_pct,
-        crop_mode=crop_mode,
-        crop_border_pixels=crop_border_pixels,
-        re_prob=re_prob,
-        re_mode=re_mode,
-        re_count=re_count,
-        re_num_splits=re_num_splits,
-        tf_preprocessing=tf_preprocessing,
-        use_prefetcher=use_prefetcher,
-        separate=num_aug_splits > 0,
-    )
+    if custom:
+        dataset.transform = classify_albumentations(augment=augment)
+    # else:
+    #     dataset.transform = create_transform(
+    #         input_size,
+    #         is_training=is_training,
+    #         no_aug=no_aug,
+    #         train_crop_mode=train_crop_mode,
+    #         scale=scale,
+    #         ratio=ratio,
+    #         hflip=hflip,
+    #         vflip=vflip,
+    #         color_jitter=color_jitter,
+    #         color_jitter_prob=color_jitter_prob,
+    #         grayscale_prob=grayscale_prob,
+    #         gaussian_blur_prob=gaussian_blur_prob,
+    #         auto_augment=auto_augment,
+    #         interpolation=interpolation,
+    #         mean=mean,
+    #         std=std,
+    #         crop_pct=crop_pct,
+    #         crop_mode=crop_mode,
+    #         crop_border_pixels=crop_border_pixels,
+    #         re_prob=re_prob,
+    #         re_mode=re_mode,
+    #         re_count=re_count,
+    #         re_num_splits=re_num_splits,
+    #         tf_preprocessing=tf_preprocessing,
+    #         use_prefetcher=use_prefetcher,
+    #         separate=num_aug_splits > 0,
+    #     )
 
     if isinstance(dataset, IterableImageDataset):
         # give Iterable datasets early knowledge of num_workers so that sample estimates
@@ -349,7 +359,7 @@ def create_loader(
         loader_args.pop('persistent_workers')  # only in Pytorch 1.7+
         loader = loader_class(dataset, **loader_args)
     if use_prefetcher:
-        prefetch_re_prob = re_prob if is_training and not no_aug else 0.
+        prefetch_re_prob = 0 # re_prob if is_training and not no_aug else 0.
         loader = PrefetchLoader(
             loader,
             mean=mean,

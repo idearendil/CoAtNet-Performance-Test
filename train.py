@@ -30,7 +30,6 @@ import torch.nn as nn
 import torchvision.utils
 import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
-
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
@@ -39,6 +38,12 @@ from timm.models import create_model, safe_model_name, resume_checkpoint, load_c
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
+from aug import classify_albumentations, denormalize_img
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+
+import sys
+from torchvision.utils import save_image
 
 try:
     from apex import amp
@@ -92,8 +97,8 @@ parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 group.add_argument('--train-split', metavar='NAME', default='train',
                    help='dataset train split (default: train)')
-group.add_argument('--val-split', metavar='NAME', default='validation',
-                   help='dataset validation split (default: validation)')
+group.add_argument('--val-split', metavar='NAME', default='val',
+                   help='dataset validation split (default: val)')
 parser.add_argument('--train-num-samples', default=None, type=int,
                     metavar='N', help='Manually specify num samples in train split, for IterableDatasets.')
 parser.add_argument('--val-num-samples', default=None, type=int,
@@ -189,9 +194,9 @@ parser.add_argument('--device-modules', default=None, type=str, nargs='+',
 
 # Optimizer parameters
 group = parser.add_argument_group('Optimizer parameters')
-group.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
+group.add_argument('--opt', default='adam', type=str, metavar='OPTIMIZER',
                    help='Optimizer (default: "sgd")')
-group.add_argument('--opt-eps', default=None, type=float, metavar='EPSILON',
+group.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON',
                    help='Optimizer Epsilon (default: None, use opt default)')
 group.add_argument('--opt-betas', default=None, type=float, nargs='+', metavar='BETA',
                    help='Optimizer Betas (default: None, use opt default)')
@@ -211,11 +216,11 @@ group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwar
 group = parser.add_argument_group('Learning rate schedule parameters')
 group.add_argument('--sched', type=str, default='cosine', metavar='SCHEDULER',
                    help='LR scheduler (default: "step"')
-group.add_argument('--sched-on-updates', action='store_true', default=False,
+group.add_argument('--sched-on-updates', action='store_true', default=True,
                    help='Apply LR scheduler step on update instead of epoch end.')
 group.add_argument('--lr', type=float, default=None, metavar='LR',
                    help='learning rate, overrides lr-base if set (default: None)')
-group.add_argument('--lr-base', type=float, default=0.1, metavar='LR',
+group.add_argument('--lr-base', type=float, default=1e-4, metavar='LR',
                    help='base learning rate: lr = lr_base * global_batch_size / base_size')
 group.add_argument('--lr-base-size', type=int, default=256, metavar='DIV',
                    help='base learning rate batch size (divisor, default: 256).')
@@ -409,8 +414,19 @@ def _parse_args():
 
 
 def main():
-    utils.setup_default_logging()
     args, args_text = _parse_args()
+
+    if args.experiment:
+        exp_name = args.experiment
+    else:
+        exp_name = '-'.join([
+            datetime.now().strftime("%Y%m%d-%H%M%S"),
+            safe_model_name(args.model)
+        ])
+
+    output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
+
+    utils.setup_default_logging(log_path = f'{output_dir}/logging.log')    
 
     if args.device_modules:
         for module in args.device_modules:
@@ -422,6 +438,7 @@ def main():
 
     args.prefetcher = not args.no_prefetcher
     args.grad_accum_steps = max(1, args.grad_accum_steps)
+    print(args)
     device = utils.init_distributed_device(args)
     if args.distributed:
         _logger.info(
@@ -637,6 +654,8 @@ def main():
     else:
         input_img_mode = args.input_img_mode
 
+    transform_train = classify_albumentations(augment=True)
+
     dataset_train = create_dataset(
         args.dataset,
         root=args.data_dir,
@@ -651,13 +670,15 @@ def main():
         input_key=args.input_key,
         target_key=args.target_key,
         num_samples=args.train_num_samples,
+        transform = transform_train
     )
 
+    transform_val = classify_albumentations(augment=False)
     if args.val_split:
         dataset_eval = create_dataset(
-            args.dataset,
-            root=args.data_dir,
-            split=args.val_split,
+            '',
+            root='hyundai_split',
+            split='val',
             is_training=False,
             class_map=args.class_map,
             download=args.dataset_download,
@@ -666,6 +687,7 @@ def main():
             input_key=args.input_key,
             target_key=args.target_key,
             num_samples=args.val_num_samples,
+            transform = transform_val
         )
 
     # setup mixup / cutmix
@@ -697,40 +719,45 @@ def main():
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
-    loader_train = create_loader(
-        dataset_train,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        is_training=True,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        re_split=args.resplit,
-        train_crop_mode=args.train_crop_mode,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        color_jitter_prob=args.color_jitter_prob,
-        grayscale_prob=args.grayscale_prob,
-        gaussian_blur_prob=args.gaussian_blur_prob,
-        auto_augment=args.aa,
-        num_aug_repeats=args.aug_repeats,
-        num_aug_splits=num_aug_splits,
-        interpolation=train_interpolation,
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        distributed=args.distributed,
-        collate_fn=collate_fn,
-        pin_memory=args.pin_mem,
-        device=device,
-        use_prefetcher=args.prefetcher,
-        use_multi_epochs_loader=args.use_multi_epochs_loader,
-        worker_seeding=args.worker_seeding,
-    )
+
+    loader_train = DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, num_workers = args.workers)
+    
+    # loader_train = create_loader(
+    #     dataset_train,
+    #     input_size=data_config['input_size'],
+    #     batch_size=args.batch_size,
+    #     custom = True,
+    #     augment = True,
+    #     is_training=True,
+    #     no_aug=args.no_aug,
+    #     re_prob=args.reprob,
+    #     re_mode=args.remode,
+    #     re_count=args.recount,
+    #     re_split=args.resplit,
+    #     train_crop_mode=args.train_crop_mode,
+    #     scale=args.scale,
+    #     ratio=args.ratio,
+    #     hflip=args.hflip,
+    #     vflip=args.vflip,
+    #     color_jitter=args.color_jitter,
+    #     color_jitter_prob=args.color_jitter_prob,
+    #     grayscale_prob=args.grayscale_prob,
+    #     gaussian_blur_prob=args.gaussian_blur_prob,
+    #     auto_augment=args.aa,
+    #     num_aug_repeats=args.aug_repeats,
+    #     num_aug_splits=num_aug_splits,
+    #     interpolation=train_interpolation,
+    #     mean=data_config['mean'],
+    #     std=data_config['std'],
+    #     num_workers=args.workers,
+    #     distributed=args.distributed,
+    #     collate_fn=collate_fn,
+    #     pin_memory=args.pin_mem,
+    #     device=device,
+    #     use_prefetcher=args.prefetcher,
+    #     use_multi_epochs_loader=args.use_multi_epochs_loader,
+    #     worker_seeding=args.worker_seeding,
+    # )
 
     loader_eval = None
     if args.val_split:
@@ -738,21 +765,26 @@ def main():
         if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
             # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
             eval_workers = min(2, args.workers)
-        loader_eval = create_loader(
-            dataset_eval,
-            input_size=data_config['input_size'],
-            batch_size=args.validation_batch_size or args.batch_size,
-            is_training=False,
-            interpolation=data_config['interpolation'],
-            mean=data_config['mean'],
-            std=data_config['std'],
-            num_workers=eval_workers,
-            distributed=args.distributed,
-            crop_pct=data_config['crop_pct'],
-            pin_memory=args.pin_mem,
-            device=device,
-            use_prefetcher=args.prefetcher,
-        )
+
+        loader_eval = DataLoader(dataset_eval, batch_size=64, shuffle=True, num_workers = args.workers)
+
+        # loader_eval = create_loader(
+        #     dataset_eval,
+        #     input_size=data_config['input_size'],
+        #     batch_size=args.validation_batch_size or args.batch_size,
+        #     custom = True,
+        #     augment = False,
+        #     is_training=False,
+        #     interpolation=data_config['interpolation'],
+        #     mean=data_config['mean'],
+        #     std=data_config['std'],
+        #     num_workers=eval_workers,
+        #     distributed=args.distributed,
+        #     crop_pct=data_config['crop_pct'],
+        #     pin_memory=args.pin_mem,
+        #     device=device,
+        #     use_prefetcher=args.prefetcher,
+        # )
 
     # setup loss function
     if args.jsd_loss:
@@ -789,17 +821,17 @@ def main():
     best_metric = None
     best_epoch = None
     saver = None
-    output_dir = None
+    # output_dir = None
     if utils.is_primary(args):
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
+        # if args.experiment:
+        #     exp_name = args.experiment
+        # else:
+        #     exp_name = '-'.join([
+        #         datetime.now().strftime("%Y%m%d-%H%M%S"),
+        #         safe_model_name(args.model),
+        #         str(data_config['input_size'][-1])
+        #     ])
+        # output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
         saver = utils.CheckpointSaver(
             model=model,
             optimizer=optimizer,
@@ -853,22 +885,26 @@ def main():
             elif args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
-            train_metrics = train_one_epoch(
-                epoch,
-                model,
-                loader_train,
-                optimizer,
-                train_loss_fn,
-                args,
-                lr_scheduler=lr_scheduler,
-                saver=saver,
-                output_dir=output_dir,
-                amp_autocast=amp_autocast,
-                loss_scaler=loss_scaler,
-                model_ema=model_ema,
-                mixup_fn=mixup_fn,
-                num_updates_total=num_epochs * updates_per_epoch,
-            )
+            try:
+                train_metrics = train_one_epoch(
+                    epoch,
+                    model,
+                    loader_train,
+                    optimizer,
+                    train_loss_fn,
+                    args,
+                    lr_scheduler=lr_scheduler,
+                    saver=saver,
+                    output_dir=output_dir,
+                    amp_autocast=amp_autocast,
+                    loss_scaler=loss_scaler,
+                    model_ema=model_ema,
+                    mixup_fn=mixup_fn,
+                    num_updates_total=num_epochs * updates_per_epoch,
+                )
+            except Exception as e:
+                _logger.exception("An error occurred during training: %s", e)
+                raise
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if utils.is_primary(args):
@@ -984,17 +1020,19 @@ def train_one_epoch(
     data_start_time = update_start_time = time.time()
     optimizer.zero_grad()
     update_sample_count = 0
+
     for batch_idx, (input, target) in enumerate(loader):
+
+
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
         update_idx = batch_idx // accum_steps
         if batch_idx >= last_batch_idx_to_accum:
             accum_steps = last_accum_steps
 
-        if not args.prefetcher:
-            input, target = input.to(device), target.to(device)
-            if mixup_fn is not None:
-                input, target = mixup_fn(input, target)
+        input, target = input.to(device), target.to(device)
+        if mixup_fn is not None:
+            input, target = mixup_fn(input, target)
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
@@ -1123,10 +1161,20 @@ def validate(
     last_idx = len(loader) - 1
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
+
+            # if batch_idx != 16:
+            #     for idx in range(len(input)):
+            #         img = (input[idx])
+            #         img = denormalize_img(img)
+            #         img = TF.to_pil_image(img)
+            #         img.save(f"./val_aug_sample_1024/{batch_idx*len(input) + idx}_val.jpg")
+            # else:
+            #     sys.exit()
+
             last_batch = batch_idx == last_idx
-            if not args.prefetcher:
-                input = input.to(device)
-                target = target.to(device)
+            
+            input = input.to(device)
+            target = target.to(device)
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 

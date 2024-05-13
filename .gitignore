@@ -119,3 +119,14 @@ Testing notebook.ipynb
 /*.png
 /*.zip
 /*.tar.*
+
+data/
+covered_data/
+covered_data_sample/
+hyundai_split/
+results/
+output/
+train_aug_sample_1024/
+14626_no_resize/
+mixed_data/
+val_aug_sample_1024/
