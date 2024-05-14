@@ -1022,6 +1022,14 @@ def train_one_epoch(
     update_sample_count = 0
 
     for batch_idx, (input, target) in enumerate(loader):
+        
+        # for idx in range(len(input)):
+        #     img = (input[idx])
+        #     img = denormalize_img(img)
+        #     img = TF.to_pil_image(img)
+        #     img.save(f"/home/work/.code/CoAtNet/pytorch-image-models/train_aug_sample_1024/{batch_idx*len(input) + idx}_train.jpg")
+        # if (batch_idx + 1) * args.batch_size >= 1024:
+        #     sys.exit()
 
 
         last_batch = batch_idx == last_batch_idx
