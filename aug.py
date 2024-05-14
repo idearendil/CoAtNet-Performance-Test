@@ -45,7 +45,7 @@ def classify_albumentations(
         if augment:  # Resize and crop
             T = []
             T += [A.RandomCropFromBorders(crop_left=crop_rate, crop_right=crop_rate, crop_top=crop_rate, crop_bottom=crop_rate)]
-            T += [A.LongestMaxSize(max_size=size)]
+            # T += [A.LongestMaxSize(max_size=size)]
             # if len(scale) == 2:
             #     T += [A.RandomResizedCrop(height=size, width=size, scale=scale, p=p_scale)]
             # elif len(scale) == 3:
@@ -76,7 +76,8 @@ def classify_albumentations(
                 T += [A.MotionBlur(blur_limit=motion_blur_limit, p=p_motion_blur)]
 
         else:  # Use fixed crop for eval set (reproducibility)
-            T = [A.LongestMaxSize(max_size=size)]
+            T = []
+        T += [A.Resize(height=size, width=size)]
         T += [A.Normalize()]  # Normalize and convert to Tensor
         T += [A.PadIfNeeded(min_height=size, min_width=size, position=A.PadIfNeeded.PositionType.TOP_LEFT, border_mode=cv2.BORDER_CONSTANT, value=0)]
         T += [ToTensorV2()]

@@ -23,7 +23,7 @@ crop_pct: null
 cutmix: 0.0
 cutmix_minmax: null
 data: null
-data_dir: covered_data
+data_dir: data
 dataset: ''
 dataset_download: false
 decay_epochs: 90
