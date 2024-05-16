@@ -23,7 +23,7 @@ crop_pct: null
 cutmix: 0.0
 cutmix_minmax: null
 data: null
-data_dir: data
+data_dir: 14626_no_resize
 dataset: ''
 dataset_download: false
 decay_epochs: 90
@@ -40,7 +40,7 @@ drop_block: null
 drop_connect: null
 drop_path: null
 epoch_repeats: 0.0
-epochs: 100
+epochs: 50
 eval_metric: top1
 experiment: ''
 fast_norm: false
@@ -117,7 +117,7 @@ save_images: false
 scale:
 - 0.08
 - 1.0
-sched: cosine
+sched: predefined_cosine
 sched_on_updates: True
 seed: 42
 smoothing: 0.1
@@ -132,11 +132,11 @@ torchscript: false
 train_crop_mode: null
 train_interpolation: random
 train_num_samples: null
-train_split: train
+train_split: test
 tta: 0
 use_multi_epochs_loader: false
 val_num_samples: null
-val_split: val
+val_split: test
 validation_batch_size: null
 vflip: 0.0
 warmup_epochs: 5

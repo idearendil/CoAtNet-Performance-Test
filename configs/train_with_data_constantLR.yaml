@@ -117,7 +117,7 @@ save_images: false
 scale:
 - 0.08
 - 1.0
-sched: cosine
+sched: None
 sched_on_updates: True
 seed: 42
 smoothing: 0.1

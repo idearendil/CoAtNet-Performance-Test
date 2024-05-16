@@ -16,9 +16,9 @@ def classify_albumentations(
         size=224,
         # scale=(0.08, 1.0),
         # p_scale=1.0,
-        crop_rate = (0.50 / 1.4),
-        rotate=10,
-        p_rotate=0.5,
+        crop_rate = (0.4 / 1.4),
+        rotate=15,
+        p_rotate=0.7,
         shear=10,
         p_shear=0.5,
         perspective=0.1,
@@ -28,11 +28,11 @@ def classify_albumentations(
         hsv_v=0.6,  # image HSV-Value augmentation (fraction)
         p_hsv=0.5,
         motion_blur_limit=[7, 51],  # motion blur
-        p_motion_blur=0.5,
-        gaussian_blur_limit=[7, 55],  # gaussian blur
-        p_gaussian_blur=0.5,
+        p_motion_blur=0.7,
+        gaussian_blur_limit=[9, 55],  # gaussian blur
+        p_gaussian_blur=0.95,
         gaussian_noise_var_limit=[10.0, 90.0],  # gaussian noise
-        p_gaussian_noise=0.5,
+        p_gaussian_noise=0.25,
         # mean=(0.0, 0.0, 0.0),  # IMAGENET_MEAN -> set as default Normalize() function's mean
         # std=(1.0, 1.0, 1.0),  # IMAGENET_STD -> set as default Normalize() function's std
 ):

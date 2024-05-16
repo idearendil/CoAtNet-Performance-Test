@@ -4,6 +4,7 @@ Hacked together by / Copyright 2021 Ross Wightman
 from typing import List, Optional, Union
 
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from .cosine_lr import CosineLRScheduler
 from .multistep_lr import MultiStepLRScheduler
@@ -11,6 +12,7 @@ from .plateau_lr import PlateauLRScheduler
 from .poly_lr import PolyLRScheduler
 from .step_lr import StepLRScheduler
 from .tanh_lr import TanhLRScheduler
+from .cosinerestarts import CosineAnnealingWarmUpRestarts
 
 
 def scheduler_kwargs(cfg, decreasing_metric: Optional[bool] = None):
@@ -196,6 +198,10 @@ def create_scheduler_v2(
             **warmup_args,
             **noise_args,
         )
+    elif sched == 'predefined_cosine':
+        lr_scheduler = CosineAnnealingWarmUpRestarts(optimizer, T_0=300, T_mult=2, eta_max=1e-4, T_up=10, gamma=0.5)
+    else:
+        lr_scheduler = None
 
     if hasattr(lr_scheduler, 'get_cycle_length'):
         # for cycle based schedulers (cosine, tanh, poly) recalculate total epochs w/ cycles & cooldown

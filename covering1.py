@@ -8,8 +8,8 @@ import multiprocessing
 
 # random.seed(0)
 
-image_dir = './data/train/others/'
-save_dir = './covered_data/train/others/'
+image_dir = './data/train/maximum-speed-limit-50/'
+save_dir = './covered_data/train/maximum-speed-limit-50/'
 images = os.listdir(image_dir)
 process_num = 8
 

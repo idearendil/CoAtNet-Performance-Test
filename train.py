@@ -30,6 +30,7 @@ import torch.nn as nn
 import torchvision.utils
 import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
@@ -428,10 +429,6 @@ def main():
 
     utils.setup_default_logging(log_path = f'{output_dir}/logging.log')    
 
-    if args.device_modules:
-        for module in args.device_modules:
-            importlib.import_module(module)
-
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -448,27 +445,7 @@ def main():
         _logger.info(f'Training with a single process on 1 device ({args.device}).')
     assert args.rank >= 0
 
-    # resolve AMP arguments based on PyTorch / Apex availability
-    use_amp = None
-    amp_dtype = torch.float16
-    if args.amp:
-        if args.amp_impl == 'apex':
-            assert has_apex, 'AMP impl specified as APEX but APEX is not installed.'
-            use_amp = 'apex'
-            assert args.amp_dtype == 'float16'
-        else:
-            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
-            use_amp = 'native'
-            assert args.amp_dtype in ('float16', 'bfloat16')
-        if args.amp_dtype == 'bfloat16':
-            amp_dtype = torch.bfloat16
-
     utils.random_seed(args.seed, args.rank)
-
-    if args.fuser:
-        utils.set_jit_fuser(args.fuser)
-    if args.fast_norm:
-        set_fast_norm()
 
     in_chans = 3
     if args.in_chans is not None:
@@ -511,9 +488,6 @@ def main():
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
 
-    if args.grad_checkpointing:
-        model.set_grad_checkpointing(enable=True)
-
     if utils.is_primary(args):
         _logger.info(
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
@@ -533,8 +507,6 @@ def main():
 
     # move model to GPU, enable channels last layout if set
     model.to(device=device)
-    if args.channels_last:
-        model.to(memory_format=torch.channels_last)
 
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
@@ -551,25 +523,7 @@ def main():
                 'Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
                 'zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.')
 
-    if args.torchscript:
-        assert not args.torchcompile
-        assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
-        assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
-        model = torch.jit.script(model)
-
-    if not args.lr:
-        global_batch_size = args.batch_size * args.world_size * args.grad_accum_steps
-        batch_ratio = global_batch_size / args.lr_base_size
-        if not args.lr_base_scale:
-            on = args.opt.lower()
-            args.lr_base_scale = 'sqrt' if any([o in on for o in ('ada', 'lamb')]) else 'linear'
-        if args.lr_base_scale == 'sqrt':
-            batch_ratio = batch_ratio ** 0.5
-        args.lr = args.lr_base * batch_ratio
-        if utils.is_primary(args):
-            _logger.info(
-                f'Learning rate ({args.lr}) calculated from base learning rate ({args.lr_base}) '
-                f'and effective global batch size ({global_batch_size}) with {args.lr_base_scale} scaling.')
+    args.lr = args.lr_base
 
     optimizer = create_optimizer_v2(
         model,
@@ -580,27 +534,8 @@ def main():
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
-    if use_amp == 'apex':
-        assert device.type == 'cuda'
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-        loss_scaler = ApexScaler()
-        if utils.is_primary(args):
-            _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
-    elif use_amp == 'native':
-        try:
-            amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
-        except (AttributeError, TypeError):
-            # fallback to CUDA only AMP for PyTorch < 1.10
-            assert device.type == 'cuda'
-            amp_autocast = torch.cuda.amp.autocast
-        if device.type == 'cuda' and amp_dtype == torch.float16:
-            # loss scaler only used for float16 (half) dtype, bfloat16 does not need it
-            loss_scaler = NativeScaler()
-        if utils.is_primary(args):
-            _logger.info('Using native Torch AMP. Training in mixed precision.')
-    else:
-        if utils.is_primary(args):
-            _logger.info('AMP not enabled. Training in float32.')
+    if utils.is_primary(args):
+        _logger.info('AMP not enabled. Training in float32.')
 
     # optionally resume from a checkpoint
     resume_epoch = None
@@ -615,36 +550,12 @@ def main():
 
     # setup exponential moving average of model weights, SWA could be used here too
     model_ema = None
-    if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before DDP wrapper
-        model_ema = utils.ModelEmaV3(
-            model,
-            decay=args.model_ema_decay,
-            use_warmup=args.model_ema_warmup,
-            device='cpu' if args.model_ema_force_cpu else None,
-        )
-        if args.resume:
-            load_checkpoint(model_ema.module, args.resume, use_ema=True)
-        if args.torchcompile:
-            model_ema = torch.compile(model_ema, backend=args.torchcompile)
 
     # setup distributed training
     if args.distributed:
-        if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
-            if utils.is_primary(args):
-                _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True)
-        else:
-            if utils.is_primary(args):
-                _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[device], broadcast_buffers=not args.no_ddp_bb)
-        # NOTE: EMA model does not need to be wrapped by DDP
-
-    if args.torchcompile:
-        # torch compile should be done after DDP
-        assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
-        model = torch.compile(model, backend=args.torchcompile)
+        if utils.is_primary(args):
+            _logger.info("Using native Torch DistributedDataParallel.")
+        model = NativeDDP(model, device_ids=[device], broadcast_buffers=not args.no_ddp_bb)
 
     # create the train and eval datasets
     if args.data and not args.data_dir:
@@ -691,25 +602,7 @@ def main():
         )
 
     # setup mixup / cutmix
-    collate_fn = None
     mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        mixup_args = dict(
-            mixup_alpha=args.mixup,
-            cutmix_alpha=args.cutmix,
-            cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob,
-            switch_prob=args.mixup_switch_prob,
-            mode=args.mixup_mode,
-            label_smoothing=args.smoothing,
-            num_classes=args.num_classes
-        )
-        if args.prefetcher:
-            assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
-            collate_fn = FastCollateMixup(**mixup_args)
-        else:
-            mixup_fn = Mixup(**mixup_args)
 
     # wrap dataset in AugMix helper
     if num_aug_splits > 1:
@@ -721,86 +614,13 @@ def main():
         train_interpolation = data_config['interpolation']
 
     loader_train = DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, num_workers = args.workers)
-    
-    # loader_train = create_loader(
-    #     dataset_train,
-    #     input_size=data_config['input_size'],
-    #     batch_size=args.batch_size,
-    #     custom = True,
-    #     augment = True,
-    #     is_training=True,
-    #     no_aug=args.no_aug,
-    #     re_prob=args.reprob,
-    #     re_mode=args.remode,
-    #     re_count=args.recount,
-    #     re_split=args.resplit,
-    #     train_crop_mode=args.train_crop_mode,
-    #     scale=args.scale,
-    #     ratio=args.ratio,
-    #     hflip=args.hflip,
-    #     vflip=args.vflip,
-    #     color_jitter=args.color_jitter,
-    #     color_jitter_prob=args.color_jitter_prob,
-    #     grayscale_prob=args.grayscale_prob,
-    #     gaussian_blur_prob=args.gaussian_blur_prob,
-    #     auto_augment=args.aa,
-    #     num_aug_repeats=args.aug_repeats,
-    #     num_aug_splits=num_aug_splits,
-    #     interpolation=train_interpolation,
-    #     mean=data_config['mean'],
-    #     std=data_config['std'],
-    #     num_workers=args.workers,
-    #     distributed=args.distributed,
-    #     collate_fn=collate_fn,
-    #     pin_memory=args.pin_mem,
-    #     device=device,
-    #     use_prefetcher=args.prefetcher,
-    #     use_multi_epochs_loader=args.use_multi_epochs_loader,
-    #     worker_seeding=args.worker_seeding,
-    # )
 
     loader_eval = None
     if args.val_split:
-        eval_workers = args.workers
-        if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
-            # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
-            eval_workers = min(2, args.workers)
-
         loader_eval = DataLoader(dataset_eval, batch_size=64, shuffle=True, num_workers = args.workers)
 
-        # loader_eval = create_loader(
-        #     dataset_eval,
-        #     input_size=data_config['input_size'],
-        #     batch_size=args.validation_batch_size or args.batch_size,
-        #     custom = True,
-        #     augment = False,
-        #     is_training=False,
-        #     interpolation=data_config['interpolation'],
-        #     mean=data_config['mean'],
-        #     std=data_config['std'],
-        #     num_workers=eval_workers,
-        #     distributed=args.distributed,
-        #     crop_pct=data_config['crop_pct'],
-        #     pin_memory=args.pin_mem,
-        #     device=device,
-        #     use_prefetcher=args.prefetcher,
-        # )
-
     # setup loss function
-    if args.jsd_loss:
-        assert num_aug_splits > 1  # JSD only valid with aug splits set
-        train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
-    elif mixup_active:
-        # smoothing is handled with mixup target transform which outputs sparse, soft targets
-        if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(
-                target_threshold=args.bce_target_thresh,
-                sum_classes=args.bce_sum,
-                pos_weight=args.bce_pos_weight,
-            )
-        else:
-            train_loss_fn = SoftTargetCrossEntropy()
-    elif args.smoothing:
+    if args.smoothing:
         if args.bce_loss:
             train_loss_fn = BinaryCrossEntropy(
                 smoothing=args.smoothing,
@@ -821,17 +641,7 @@ def main():
     best_metric = None
     best_epoch = None
     saver = None
-    # output_dir = None
     if utils.is_primary(args):
-        # if args.experiment:
-        #     exp_name = args.experiment
-        # else:
-        #     exp_name = '-'.join([
-        #         datetime.now().strftime("%Y%m%d-%H%M%S"),
-        #         safe_model_name(args.model),
-        #         str(data_config['input_size'][-1])
-        #     ])
-        # output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
         saver = utils.CheckpointSaver(
             model=model,
             optimizer=optimizer,
@@ -874,8 +684,7 @@ def main():
             lr_scheduler.step(start_epoch)
 
     if utils.is_primary(args):
-        _logger.info(
-            f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
+        _logger.info(f'Scheduled epochs: {num_epochs}.')
 
     results = []
     try:
@@ -959,7 +768,7 @@ def main():
                 # save proper checkpoint with eval metric
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=latest_metric)
 
-            if lr_scheduler is not None:
+            if lr_scheduler is not None and args.sched != 'predefined_cosine':
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, latest_metric)
 
@@ -1136,7 +945,9 @@ def train_one_epoch(
                 (update_idx + 1) % args.recovery_interval == 0):
             saver.save_recovery(epoch, batch_idx=update_idx)
 
-        if lr_scheduler is not None:
+        if args.sched == 'predefined_cosine':
+            lr_scheduler.step()
+        elif lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         update_sample_count = 0

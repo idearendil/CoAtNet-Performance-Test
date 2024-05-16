@@ -6,8 +6,8 @@ from PIL import Image
 import os
 import multiprocessing
 
-src_dir = './covered_data/train/others/'
-dest_dir = './mixed_data/train/others/'
+src_dir = './covered_data/train/maximum-speed-limit-50/'
+dest_dir = './mixed_data/train/maximum-speed-limit-50/'
 images = os.listdir(src_dir)
 process_num = 8
 
