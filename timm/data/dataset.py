@@ -12,6 +12,8 @@ from PIL import Image
 import numpy as np
 from torchvision.transforms import ToTensor, ToPILImage
 import sys
+import os
+from threading import Thread
 
 from .readers import create_reader
 from aug import denormalize_img
@@ -64,7 +66,7 @@ class ImageDataset(data.Dataset):
         self._consecutive_errors = 0
 
         if self.input_img_mode and not self.load_bytes:
-            img = img.convert(self.input_img_mode)
+            img = img.convert(self.input_img_mode).resize((70, 70))
         if self.transform is not None:
             img = self.transform(image=np.array(img))["image"]   # img = self.transform(img)
         if target is None:
@@ -82,6 +84,66 @@ class ImageDataset(data.Dataset):
 
     def filenames(self, basename=False, absolute=False):
         return self.reader.filenames(basename, absolute)
+
+
+class CustomImageDataset(data.Dataset):
+
+    def load_img(self, img_name_lst, data_lst, label_lst, class_dir, class_idx, class_name):
+        total_num = len(img_name_lst)
+        percent = 0.0
+        for img_idx, img_name in enumerate(img_name_lst):
+            img_path = os.path.join(class_dir, img_name)
+            image = Image.open(img_path).convert(self.input_img_mode).resize((224, 224))
+            data_lst.append(np.array(image, dtype=np.uint8))
+            label_lst.append(class_idx)
+            if percent <= img_idx / total_num:
+                print(class_name, 'loading is completed', percent * 100, '%!')
+                percent += 0.05
+
+    def __init__(
+            self,
+            root,
+            split='train',
+            input_img_mode='RGB',
+            transform=None
+            ):
+        self.process_num = 10
+        self.data = [list() for _ in range(self.process_num)]
+        self.labels = [list() for _ in range(self.process_num)]
+        self.root_dir = root
+        self.transform = transform
+        self.input_img_mode = input_img_mode
+        self.total_data_size = 0
+        
+        
+        for class_idx, class_name in enumerate(os.listdir(self.root_dir)):
+            class_dir = os.path.join(self.root_dir, class_name)
+            if os.path.isdir(class_dir):
+                img_name_lst = os.listdir(class_dir)
+                total_num = len(img_name_lst)
+                processes = [Thread(target=self.load_img, args=(img_name_lst[total_num // self.process_num * i:total_num // self.process_num * (i + 1)], self.data[i], self.labels[i], class_dir, class_idx, class_name)) for i in range(self.process_num)]
+                for process in processes:
+                    process.start()
+
+                for process in processes:
+                    process.join()
+        
+        for a_data in self.data:
+            self.total_data_size += len(a_data)
+        print('total dataset size is', self.total_data_size, '!!!')
+    
+    def __len__(self):
+        return self.total_data_size
+    
+    def __getitem__(self, idx):
+        for i in range(self.process_num):
+            if idx < self.total_data_size // self.process_num * (i+1):
+                image = self.data[i][idx - self.total_data_size // self.process_num * i]
+                label = self.labels[i][idx - self.total_data_size // self.process_num * i]
+                break
+        if self.transform:
+            image = self.transform(image=image)["image"]
+        return image, label
 
 
 class IterableImageDataset(data.IterableDataset):

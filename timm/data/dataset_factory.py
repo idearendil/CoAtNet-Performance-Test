@@ -27,7 +27,7 @@ try:
 except ImportError:
     has_imagenet = False
 
-from .dataset import IterableImageDataset, ImageDataset
+from .dataset import IterableImageDataset, ImageDataset, CustomImageDataset
 
 _TORCH_BASIC_DS = dict(
     cifar10=CIFAR10,
