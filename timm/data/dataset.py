@@ -20,6 +20,10 @@ from aug import denormalize_img
 
 _logger = logging.getLogger(__name__)
 
+import cv2
+from random import randint, random
+import random
+
 
 _ERROR_RETRY = 50
 
@@ -36,6 +40,7 @@ class ImageDataset(data.Dataset):
             input_img_mode='RGB',
             transform=None,
             target_transform=None,
+            cover_prob=0.0,
     ):
         if reader is None or isinstance(reader, str):
             reader = create_reader(
@@ -48,8 +53,58 @@ class ImageDataset(data.Dataset):
         self.load_bytes = load_bytes
         self.input_img_mode = input_img_mode
         self.transform = transform
+        self.cover_prob = cover_prob
         self.target_transform = target_transform
         self._consecutive_errors = 0
+    
+    def covering(self, org_img):
+
+        org_img = np.stack((org_img[0], org_img[1], org_img[2]), axis=2)
+
+        width, height = org_img.shape[0], org_img.shape[1]
+        q_width1 = int(width / 4)
+        q_height1 = int(height / 4)
+        q_width2 = int(width * 3 / 4)
+        q_height2 = int(height * 3 / 4)
+        limit = min(width, height)
+
+        blue_color = (255, 0, 0)
+        green_color = (0, 255, 0)
+        red_color = (0, 0, 255)
+        white_color = (255, 255, 255)
+        cover_color = (randint(0, 255), randint(0, 255), randint(0, 255))
+
+        blank_img = np.zeros((width, height, 3), np.uint8)
+        center_area = np.array([[q_width1, q_height1], [q_width1, q_height2], [q_width2, q_height2], [q_width2, q_height1]], np.int32)
+        only_center = cv2.fillConvexPoly(blank_img, center_area, white_color)
+
+        while True:
+            blank_img = np.zeros((width, height, 3), np.uint8)
+            cover1 = np.array([[randint(0, limit), randint(0, limit)], [randint(0, limit), randint(0, limit)], [randint(0, limit), randint(0, limit)]], np.int32)
+            plus_cover1 = cv2.fillConvexPoly(blank_img, cover1, white_color)
+            cover2 = np.array([[randint(0, limit), randint(0, limit)], [randint(0, limit), randint(0, limit)], [randint(0, limit), randint(0, limit)]], np.int32)
+            plus_cover2 = cv2.fillConvexPoly(plus_cover1, cover2, white_color)
+
+            cover_pixel_num = np.count_nonzero(plus_cover2) / 3
+            cover_ratio = cover_pixel_num / (width * height)
+            if cover_ratio < 0.03:      # prevent too small cover
+                continue
+
+            center_cover1 = np.logical_and(plus_cover2, only_center).astype(dtype=np.uint8) * 255
+            covered_pixel_num = np.count_nonzero(center_cover1) / 3
+            covered_ratio = covered_pixel_num / (width * height / 4)
+            if covered_ratio < 0.05 or covered_ratio > 0.25:    # prevent useless cover & too large cover
+                continue
+            threshold = abs(covered_ratio - 0.15) / 0.1
+            rand_num = random.random()
+            if rand_num > threshold:        # control probability distribution
+                continue
+            break
+
+        img = cv2.fillConvexPoly(org_img, cover1, cover_color)
+        img = cv2.fillConvexPoly(img, cover2, cover_color)
+
+        return torch.Tensor(np.stack((img[:,:,0], org_img[:,:,1], org_img[:,:,2]), axis=0).astype(np.float32))
 
     def __getitem__(self, index):
         img, target = self.reader[index]
@@ -66,9 +121,13 @@ class ImageDataset(data.Dataset):
         self._consecutive_errors = 0
 
         if self.input_img_mode and not self.load_bytes:
-            img = img.convert(self.input_img_mode).resize((70, 70))
+            img = img.convert(self.input_img_mode)
         if self.transform is not None:
             img = self.transform(image=np.array(img))["image"]   # img = self.transform(img)
+        if self.cover_prob > 0.0:
+            rand_num = random.random()
+            if rand_num < self.cover_prob:
+                img = self.covering(org_img=np.array(img))
         if target is None:
             target = -1
         elif self.target_transform is not None:

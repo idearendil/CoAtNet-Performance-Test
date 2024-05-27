@@ -581,7 +581,8 @@ def main():
         input_key=args.input_key,
         target_key=args.target_key,
         num_samples=args.train_num_samples,
-        transform = transform_train
+        transform=transform_train,
+        cover_prob=args.cover_prob
     )
 
     transform_val = classify_albumentations(augment=False)
@@ -839,7 +840,6 @@ def train_one_epoch(
             img.save(f"/home/work/.code/CoAtNet/pytorch-image-models/train_aug_sample_1024/{batch_idx*len(input) + idx}_train.jpg")
         if (batch_idx + 1) * args.batch_size >= 1024:
             sys.exit()
-
 
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
