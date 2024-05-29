@@ -77,7 +77,7 @@ def classify_albumentations(
 
         else:  # Use fixed crop for eval set (reproducibility)
             T = [A.LongestMaxSize(max_size=size)]
-        T += [A.Normalize()]  # Normalize and convert to Tensor
+        T += [A.Normalize(normalization="image_per_channel")]  # Normalize and convert to Tensor
         T += [A.PadIfNeeded(min_height=size, min_width=size, position=A.PadIfNeeded.PositionType.TOP_LEFT, border_mode=cv2.BORDER_CONSTANT, value=0)]
         T += [ToTensorV2()]
         return A.Compose(T)

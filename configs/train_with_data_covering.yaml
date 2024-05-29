@@ -145,4 +145,4 @@ warmup_prefix: false
 weight_decay: 2.0e-05
 worker_seeding: all
 workers: 8
-cover_prob: 0.1
+cover_prob: 0.25

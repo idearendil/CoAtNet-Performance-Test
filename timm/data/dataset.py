@@ -59,8 +59,6 @@ class ImageDataset(data.Dataset):
     
     def covering(self, org_img):
 
-        org_img = np.stack((org_img[0], org_img[1], org_img[2]), axis=2)
-
         width, height = org_img.shape[0], org_img.shape[1]
         q_width1 = int(width / 4)
         q_height1 = int(height / 4)
@@ -104,7 +102,7 @@ class ImageDataset(data.Dataset):
         img = cv2.fillConvexPoly(org_img, cover1, cover_color)
         img = cv2.fillConvexPoly(img, cover2, cover_color)
 
-        return torch.Tensor(np.stack((img[:,:,0], org_img[:,:,1], org_img[:,:,2]), axis=0).astype(np.float32))
+        return img.astype(np.float32)
 
     def __getitem__(self, index):
         img, target = self.reader[index]
@@ -122,12 +120,12 @@ class ImageDataset(data.Dataset):
 
         if self.input_img_mode and not self.load_bytes:
             img = img.convert(self.input_img_mode)
-        if self.transform is not None:
-            img = self.transform(image=np.array(img))["image"]   # img = self.transform(img)
         if self.cover_prob > 0.0:
             rand_num = random.random()
             if rand_num < self.cover_prob:
                 img = self.covering(org_img=np.array(img))
+        if self.transform is not None:
+            img = self.transform(image=np.array(img))["image"]
         if target is None:
             target = -1
         elif self.target_transform is not None:
